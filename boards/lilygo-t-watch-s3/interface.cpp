@@ -19,13 +19,41 @@ SensorDRV2605 drv;
 ***************************************************************************************/
 void _setup_gpio() {
     pinMode(16, INPUT); // Touch IRQ
-    Wire.begin(10, 11); // sensors
+
+    // --- I2C bus recovery ---
+    // The new ESP32 arduino core (i2c-ng / IDF 5.x i2c_master driver) returns
+    // ESP_ERR_INVALID_STATE on every transmit if SDA/SCL are held low at boot.
+    // The old core tolerated this; the new one refuses. Manually clock the bus
+    // free (9 pulses) and release the lines before letting the drivers begin().
+    auto i2c_recover = [](int sda, int scl) {
+        pinMode(sda, INPUT_PULLUP);
+        pinMode(scl, OUTPUT_OPEN_DRAIN);
+        digitalWrite(scl, HIGH);
+        delayMicroseconds(10);
+        for (int i = 0; i < 9 && digitalRead(sda) == LOW; i++) {
+            digitalWrite(scl, LOW);
+            delayMicroseconds(10);
+            digitalWrite(scl, HIGH);
+            delayMicroseconds(10);
+        }
+        // generate a STOP condition
+        pinMode(sda, OUTPUT_OPEN_DRAIN);
+        digitalWrite(sda, LOW);
+        delayMicroseconds(10);
+        digitalWrite(scl, HIGH);
+        delayMicroseconds(10);
+        digitalWrite(sda, HIGH);
+        delayMicroseconds(10);
+        pinMode(sda, INPUT);
+        pinMode(scl, INPUT);
+    };
+    i2c_recover(10, 11); // sensor bus (PMU/RTC/haptic)
+    i2c_recover(39, 40); // touch bus
     delay(10);
-    Wire1.begin(39, 40); // touchscreen
-    delay(10);
+
     _rtc.setWire(&Wire); // Cplus uses Wire1 default, the lib had been changed to accept setting I2C bus
                          // StickCPlus uses BM8563 that is the same as PCF8536
-    axp192.init(Wire, 10, 11);
+    axp192.init(Wire, 10, 11); // first (and only) begin() on the sensor bus (SDA10/SCL11)
     axp192.setVbusVoltageLimit(XPOWERS_AXP2101_VBUS_VOL_LIM_4V36);
     axp192.setVbusCurrentLimit(XPOWERS_AXP2101_VBUS_CUR_LIM_900MA);
     axp192.setSysPowerDownVoltage(2600);
@@ -158,46 +186,95 @@ struct TP {
 ** Function: InputHandler
 ** Handles the variables PrevPress, NextPress, SelPress, AnyKeyPress and EscPress
 **********************************************************************/
+// Swipe + tap navigation (replaces the invisible 3x3 tap-zone grid).
+//   swipe up    -> next item      (DownPress)
+//   swipe down  -> previous item  (UpPress)
+//   tap         -> select         (SelPress)
+//   swipe right -> back / exit    (EscPress)
+// UpPress/DownPress are used (not Prev/NextPress) because loopOptions() runs a
+// button-hold spinner loop on PrevPress that would stall on a quick swipe.
 void InputHandler(void) {
+    static bool touching = false;
+    static int sx = 0, sy = 0;         // gesture start point
+    static int cx = 0, cy = 0;         // latest point during the gesture
+    static unsigned long lastFire = 0; // debounce between gestures
+
     TP t;
-    static unsigned long tm = 0;
-    if (millis() - tm > 200 || LongPress) {
-        // I know R3CK.. I Should NOT nest if statements..
-        // but it is needed to not keep SPI bus used without need, it save resources
-        if (getTouched()) {
-            touch.getPoint(t.x, t.y, 1);
-            // Serial.printf("\nRAW: Touch Pressed on x=%d, y=%d",t.x, t.y);
-            if (bruceConfigPins.rotation == 3) {
-                t.y[0] = (tftHeight + 20) - t.y[0];
-                t.x[0] = t.x[0];
-            }
-            if (bruceConfigPins.rotation == 0) {
-                int tmp = t.x[0];
-                t.x[0] = tftWidth - t.y[0];
-                t.y[0] = tftHeight - tmp;
-            }
-            if (bruceConfigPins.rotation == 2) {
-                int tmp = t.x[0];
-                t.x[0] = t.y[0];
-                t.y[0] = tmp;
-            }
-            if (bruceConfigPins.rotation == 1) { t.x[0] = tftWidth - t.x[0]; }
-            // Serial.printf("\nROT: Touch Pressed on x=%d, y=%d\n",t.x[0], t.y[0]);
 
-            if (!wakeUpScreen()) AnyKeyPress = true;
-            else return;
-
-            // Touch point global variable
-            touchPoint.x = t.x[0];
-            touchPoint.y = t.y[0];
-            touchPoint.pressed = true;
-            touchHeatMap(touchPoint);
-
-            tm = millis();
-            drv.setWaveform(0, 75);
-            drv.setWaveform(1, 0); // end waveform
-            drv.run();
+    if (getTouched()) {
+        touch.getPoint(t.x, t.y, 1);
+        if (bruceConfigPins.rotation == 3) { t.y[0] = (tftHeight + 20) - t.y[0]; }
+        if (bruceConfigPins.rotation == 0) {
+            int tmp = t.x[0];
+            t.x[0] = tftWidth - t.y[0];
+            t.y[0] = tftHeight - tmp;
         }
+        if (bruceConfigPins.rotation == 2) {
+            int tmp = t.x[0];
+            t.x[0] = t.y[0];
+            t.y[0] = tmp;
+        }
+        if (bruceConfigPins.rotation == 1) { t.x[0] = tftWidth - t.x[0]; }
+
+        // A touch while the screen is asleep just wakes it; don't treat as a gesture.
+        if (wakeUpScreen()) {
+            touching = false;
+            return;
+        }
+        AnyKeyPress = true;
+
+        if (!touching) {
+            touching = true;
+            sx = t.x[0];
+            sy = t.y[0];
+        }
+        cx = t.x[0];
+        cy = t.y[0];
+
+        // Keep the raw point live for direct-touch screens (on-screen keyboard, etc.)
+        touchPoint.x = t.x[0];
+        touchPoint.y = t.y[0];
+        touchPoint.pressed = true;
+    } else if (touching) {
+        // Finger lifted -> classify the gesture.
+        touching = false;
+        touchPoint.pressed = false;
+
+        int dx = cx - sx;
+        int dy = cy - sy;
+        int adx = dx < 0 ? -dx : dx;
+        int ady = dy < 0 ? -dy : dy;
+
+        const int TAP_MAX = 30;   // total movement <= this  => tap
+        const int SWIPE_MIN = 45; // movement >= this along an axis => swipe
+
+        if (millis() - lastFire < 120) return; // debounce
+
+        if (adx <= TAP_MAX && ady <= TAP_MAX) {
+            SelPress = true; // tap -> select highlighted item
+        } else if (ady >= adx) {
+            if (dy < -SWIPE_MIN) DownPress = true;     // swipe up   -> next item
+            else if (dy > SWIPE_MIN) UpPress = true;   // swipe down -> previous item
+            else return;                               // movement too small, ignore
+        } else {
+            if (dx > SWIPE_MIN) EscPress = true;       // swipe right -> back / exit
+            else if (dx < -SWIPE_MIN) SelPress = true; // swipe left -> select (alt)
+            else return;                               // movement too small, ignore
+        }
+
+        // CRITICAL: mark AnyKeyPress so the input task holds the flag (~75ms) instead
+        // of clearing it on the next ~10ms tick before the menu can read it.
+        AnyKeyPress = true;
+        lastFire = millis();
+
+        Serial.printf(
+            "[NAV] dx=%d dy=%d -> %s\n", dx, dy,
+            DownPress ? "NEXT(swipe-up)"
+                      : UpPress   ? "PREV(swipe-down)"
+                      : SelPress  ? "SELECT(tap)"
+                      : EscPress  ? "BACK(swipe-right)"
+                                  : "?"
+        );
     }
 }
 

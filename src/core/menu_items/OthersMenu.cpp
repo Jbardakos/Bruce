@@ -8,6 +8,7 @@
 #include "modules/others/ibutton.h"
 #include "modules/others/mic.h"
 #include "modules/others/qrcode_menu.h"
+#include "modules/others/step_counter.h"
 #include "modules/others/tururururu.h"
 #include "modules/others/u2f.h"
 // Removed: #include "modules/others/timer.h"
@@ -16,6 +17,10 @@ void OthersMenu::optionsMenu() {
     options = {
         {"QRCodes",      qrcode_menu                  },
         {"Megalodon",    shark_setup                  },
+
+#ifdef T_WATCH_S3
+        {"Step Counter", stepCounter                  },
+#endif
 
 #if defined(MIC_SPM1423) || defined(MIC_INMP441)
         {"Microphone",   [this]() { micMenu(); }      }, //@deveclipse
